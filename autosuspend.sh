@@ -102,7 +102,7 @@ do
     if [ $myres -eq 1 ]
     then    # reset countdown
         mycountdown=$countdown
-        echo Reset countdown
+        echo Reset countdown : $mycountdown sec
     else    # decrease countdown
         mycountdown=$(( $mycountdown - $timestep ))
         echo Decrease countdown : $mycountdown
