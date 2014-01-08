@@ -10,6 +10,7 @@
 # allow me to wake my storage machine and let it autosuspend if unused.
 #
 # 08/01/2014 : no longer need dstat to compute netspeed, use /proc/net/dev
+# compute user idle time using stat on tty device, no more errors
 
 # countdown in seconds
 countdown=3600
@@ -20,8 +21,8 @@ timestep=30
 # user idle time before sleep
 idletime=60
 
-# network threshold to go below before sleep
-netthreshold=100000
+# network threshold to go below before sleep in kBps
+netthreshold=100
 
 # nb iterations (test purpose)
 nbiter=10
@@ -30,14 +31,16 @@ function isUserActive()
 {
     res=0
     n=$(date "+%s")
-    for u in $(w -hs | awk '{ print $3 }' | sed -e 's/\([0-9]\)s$/\1sec/')
+    for tty in $(w -h | tr -s ' ' | cut -d' ' -f2)
     do
-        #echo $u
-        d=$(date -d "-$u" "+%s")
-        t=$(( n - d ))
+	# stat the tty device to have la modif time
+	lastmodif=$(ls -l --time-style=full-iso /dev/$tty | tr -s ' ' | cut -d' ' -f 7,8,9)
+        d=$(date -d "$lastmodif" "+%s")	# unix timestamp
+        t=$(( $n - $d )) # idletime
+        #echo $tty $d $t
         if [ $t -lt $idletime ]
         then
-            echo "user active"
+            echo "user active : " $tty $t sec
             res=1
         fi
     done
@@ -69,7 +72,7 @@ function isNetworkUsed()
 	# put in kB
 	total=$(( $total / 1024 ))
 
-        echo $total "kB/sec"
+        echo $total kB/sec
 
     if [ $total -gt $netthreshold ] # 100ko/sec
     then
@@ -79,12 +82,12 @@ function isNetworkUsed()
 }
 
 start=$(date "+%s")
-
+mycountdown=$countdown
 mynbiter=0
 while [ 1 ]
 do
     n=$(date "+%s")
-    echo $n
+    #echo $n
 
     myres=0
 
@@ -115,7 +118,7 @@ do
         mycountdown=$countdown
     fi
 
-    echo Sleep $timestep
+    echo Sleep $timestep sec
     sleep $timestep
 
     mynbiter=$(( $mynbiter + 1 ))
