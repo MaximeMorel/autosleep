@@ -11,6 +11,7 @@
 #
 # 08/01/2014 : no longer need dstat to compute netspeed, use /proc/net/dev
 # compute user idle time using stat on tty device, no more errors
+# fix getting stat info with ls -lu (atime field)
 
 # countdown in seconds
 countdown=3600
@@ -34,7 +35,7 @@ function isUserActive()
     for tty in $(w -h | tr -s ' ' | cut -d' ' -f2)
     do
 	# stat the tty device to have la modif time
-	lastmodif=$(ls -l --time-style=full-iso /dev/$tty | tr -s ' ' | cut -d' ' -f 7,8,9)
+	lastmodif=$(ls -lu --time-style=full-iso /dev/$tty | tr -s ' ' | cut -d' ' -f 7,8,9)
         d=$(date -d "$lastmodif" "+%s")	# unix timestamp
         t=$(( $n - $d )) # idletime
         #echo $tty $d $t
