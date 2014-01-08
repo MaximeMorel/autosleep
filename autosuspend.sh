@@ -8,12 +8,14 @@
 # Changelog
 # 06/01/2014 : Actually quite ugly, but does what I need :
 # allow me to wake my storage machine and let it autosuspend if unused.
+#
+# 08/01/2014 : no longer need dstat to compute netspeed, use /proc/net/dev
 
 # countdown in seconds
 countdown=3600
 
 # timestep in seconds
-timestep=10
+timestep=30
 
 # user idle time before sleep
 idletime=60
@@ -41,20 +43,35 @@ function isUserActive()
     done
 }
 
+function getTotalTraffic()
+{
+        val=$(cat /proc/net/dev | grep eth0 | tr -s ' ' | cut -f3,11 -d ' ')
+        down=$(echo $val | cut -f1 -d' ') # down
+        up=$(echo $val | cut -f2 -d' ') # up
+        # sum
+        total=$(( $down + $up ))
+}
+getTotalTraffic
+old_total=$total
+
 function isNetworkUsed()
 {
-    res=0
-    # get network bandwidth in, out
-    tmp=$(dstat -n 1 1 | awk 'END{ print $1, $2}')
-    v1=$(echo $tmp | cut -f1 -d' ') # in
-    v2=$(echo $tmp | cut -f2 -d' ') # out
-    v1=$(echo $(( $(echo $v1 | sed -e 's/B/*1/' -e 's/k/*1000/') ))) # remove unit, put in byte
-    v2=$(echo $(( $(echo $v2 | sed -e 's/B/*1/' -e 's/k/*1000/') ))) # remove unit, put in byte
-    # sum
-    v=$(echo $(( $v1 + $v2 )) )
+	res=0
 
-    echo $v1 + $v2 = $v
-    if [ $v -gt $netthreshold ] # 100ko/sec
+	getTotalTraffic
+        new_total=$total
+        total=$(( $new_total - $old_total ))
+        old_total=$new_total
+
+	# per sec value
+	total=$(( $total / $timestep ))
+
+	# put in kB
+	total=$(( $total / 1024 ))
+
+        echo $total "kB/sec"
+
+    if [ $total -gt $netthreshold ] # 100ko/sec
     then
         echo "network active"
         res=1
