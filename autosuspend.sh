@@ -106,7 +106,7 @@ do
         echo Reset countdown : $mycountdown sec
     else    # decrease countdown
         mycountdown=$(( $mycountdown - $timestep ))
-        echo Decrease countdown : $mycountdown
+        echo Decrease countdown : $mycountdown sec \($(( $mycountdown / 60 )) min\) before suspend
     fi
 
     if [ $mycountdown -le 0 ]
