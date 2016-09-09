@@ -7,6 +7,10 @@
 # Author : Maxime Morel <maxime.morel69@gmail.com>
 
 # Changelog
+# 2016/09/09:
+# Show date in log at each iteration.
+# Fix network traffic.
+#
 # 2016/09/07:
 # Fix indentation.
 # Detect at the beginning if systemd is present and store it in a flag.
@@ -80,26 +84,17 @@ function isUserActive()
     return $res
 }
 
-function getTotalTraffic()
-{
-    local val=$(cat /proc/net/dev | grep $network_interface | tr -s ' ' | cut -f3,11 -d ' ')
-    local down=$(echo $val | cut -f1 -d' ') # down
-    local up=$(echo $val | cut -f2 -d' ') # up
-    # sum
-    local total=$(( $down + $up ))
-    return $total
-}
-getTotalTraffic
-old_total=$?
-
+old_total=0
 function isNetworkUsed()
 {
     local res=0
 
-    getTotalTraffic
-    local new_total=$?
-    local total=$(( $new_total - $old_total ))
-    old_total=$new_total
+    local val=$(cat /proc/net/dev | grep $network_interface | tr -s ' ' | cut -f3,11 -d ' ')
+    local down=$(echo $val | cut -f1 -d' ')
+    local up=$(echo $val | cut -f2 -d' ')
+    local fulltotal=$(( $down + $up ))
+    local total=$(( $fulltotal - $old_total ))
+    old_total=$fulltotal
 
     # per sec value
     total=$(( $total / $timestep ))
@@ -161,6 +156,7 @@ mycountdown=$countdown
 mynbiter=0
 while [ 1 ]
 do
+    date +"%F %T"
     n=$(date "+%s")
 
     finalres=0
@@ -199,6 +195,7 @@ do
     fi
 
     echo "Sleep $timestep sec"
+    echo ""
     sleep $timestep
 
     mynbiter=$(( $mynbiter + 1 ))
