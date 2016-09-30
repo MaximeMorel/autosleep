@@ -7,6 +7,11 @@
 # Author : Maxime Morel <maxime.morel69@gmail.com>
 
 # Changelog
+# 2016/09/29:
+# Show remaining time in human format.
+# Countdown and time step can be set as a parameters.
+# Script can be stopped by touching a stop file.
+#
 # 2016/09/09:
 # Show date in log at each iteration.
 # Fix network traffic.
@@ -33,9 +38,17 @@
 
 # countdown in seconds
 countdown=14400
+if [ $# -ge 1 ]
+then
+    countdown=$1
+fi
 
 # timestep in seconds
 timestep=30
+if [ $# -ge 2 ]
+then
+    timestep=$2
+fi
 
 # user idle time before sleep
 idletime=60
@@ -62,6 +75,27 @@ fi
 # nb iterations (test purpose)
 nbiter=10
 
+# stop file, touch it to exit the script
+stopFile=/tmp/autosuspend.stop
+
+function printTime()
+{
+    local t=$1
+    local hours=$(( $t / 3600 ))
+    local minutes=$(( $t % 3600 ))
+    local seconds=$(( $minutes % 60 ))
+    minutes=$(( $minutes / 60 ))
+    if [ $hours -gt 0 ]
+    then
+        echo -n "${hours}h "
+    fi
+    if [ $minutes -gt 0 -o $hours -gt 0 ]
+    then
+        echo -n "${minutes}m "
+    fi
+    echo -n "${seconds}s"
+}
+
 function isUserActive()
 {
     local res=0
@@ -76,11 +110,12 @@ function isUserActive()
         #echo "$tty $d $t"
         if [ $t -lt $idletime ]
         then
-            echo "User active: $tty $t sec"
+            echo -n "User active: $tty "
+            printTime $t
+            echo ""
             res=1
         fi
     done
-
     return $res
 }
 
@@ -88,7 +123,6 @@ old_total=0
 function isNetworkUsed()
 {
     local res=0
-
     local val=$(cat /proc/net/dev | grep $network_interface | tr -s ' ' | cut -f3,11 -d ' ')
     local down=$(echo $val | cut -f1 -d' ')
     local up=$(echo $val | cut -f2 -d' ')
@@ -107,7 +141,6 @@ function isNetworkUsed()
         echo "Network active: $total KiBps"
         res=1
     fi
-
     return $res
 }
 
@@ -119,7 +152,9 @@ function isLockFileTouched()
         local t=$(( ($(date +%s) - $(stat -c %Y "$lockFile")) ))
         if [ $t -lt $idletime ]
         then
-            echo "Lock file touched: $t sec"
+            echo -n "Lock file touched: "
+            printTime $t
+            echo ""
             res=1
         fi
     fi
@@ -152,52 +187,67 @@ function sendHibernate()
     fi
 }
 
-mycountdown=$countdown
-mynbiter=0
-while [ 1 ]
-do
-    date +"%F %T"
-    n=$(date "+%s")
+function mainLoop()
+{
+    local mycountdown=$countdown
+    local stopLoop=0
+    while [ $stopLoop -eq 0 ]
+    do
+        date +"%F %T"
+        local n=$(date "+%s")
 
-    finalres=0
-    res=0
+        local finalres=0
+        local res=0
 
-    isUserActive
-    res=$?
-    finalres=$(( $finalres | $res ))
+        isUserActive
+        res=$?
+        finalres=$(( $finalres | $res ))
 
-    isNetworkUsed
-    res=$?
-    finalres=$(( $finalres | $res ))
+        isNetworkUsed
+        res=$?
+        finalres=$(( $finalres | $res ))
 
-    isLockFileTouched
-    res=$?
-    finalres=$(( $finalres | $res ))
+        isLockFileTouched
+        res=$?
+        finalres=$(( $finalres | $res ))
 
-    # if finalres is 1 then we have at least one condition which prevents going to suspend
-    if [ $finalres -eq 1 ]
-    then
-        mycountdown=$countdown
-        echo "Reset countdown: $mycountdown sec"
-    else
-        mycountdown=$(( $mycountdown - $timestep ))
-        echo "Decrease countdown: $mycountdown sec ($(( $mycountdown / 60 )) min) before suspend"
-    fi
+        # if finalres is 1 then we have at least one condition which prevents going to suspend
+        if [ $finalres -eq 1 ]
+        then
+            mycountdown=$countdown
+            echo -n "Reset countdown: "
+            printTime $mycountdown
+            echo ""
+        else
+            mycountdown=$(( $mycountdown - $timestep ))
+            echo -n "Decrease countdown: "
+            printTime $mycountdown
+            echo " before suspend"
+        fi
 
-    if [ $mycountdown -le 0 ]
-    then
-        echo "Go to suspend"
-        # suspend command
-        sendHibernate
+        if [ $mycountdown -le 0 ]
+        then
+            echo "Go to suspend"
+            # suspend command
+            sendHibernate
 
-        # reset countdown
-        mycountdown=$countdown
-    fi
+            # reset countdown
+            mycountdown=$countdown
+        fi
 
-    echo "Sleep $timestep sec"
-    echo ""
-    sleep $timestep
+        echo -n "Sleep "
+        printTime $timestep
+        echo ""
+        sleep $timestep
 
-    mynbiter=$(( $mynbiter + 1 ))
-done
+	if [ -f "$stopFile" ]
+	then
+		rm "$stopFile"
+		echo "Stop file touched, exiting..."
+		stopLoop=1
+	fi
+    done
+}
+
+mainLoop
 
