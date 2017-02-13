@@ -7,6 +7,9 @@
 # Author : Maxime Morel <maxime.morel69@gmail.com>
 
 # Changelog
+# 2017/02/03:
+# Separate threshold for day and night.
+#
 # 2016/09/29:
 # Show remaining time in human format.
 # Countdown and time step can be set as a parameters.
@@ -36,8 +39,16 @@
 # Currently quite ugly, but does what I need:
 # Allows me to wake my storage machine and let it autosuspend if unused.
 
+# day time starts at 7:00
+dayTime=7
+
+# night time starts at 23:00
+nightTime=23
+
 # countdown in seconds
 countdown=14400
+countdownDay=14400
+countdownNight=7200
 if [ $# -ge 1 ]
 then
     countdown=$1
@@ -51,10 +62,12 @@ then
 fi
 
 # user idle time before sleep
-idletime=60
+useridletime=60
 
 # network threshold to go below before sleep in KiBps
 netthreshold=100
+netthresholdDay=100
+netthresholdNight=2000
 
 # network interface to monitor
 network_interface=eth0
@@ -106,9 +119,9 @@ function isUserActive()
         # stat the tty device to have last modif time
         local lastmodif=$(ls -lu --time-style=full-iso /dev/$tty | tr -s ' ' | cut -d' ' -f 7,8,9)
         local d=$(date -d "$lastmodif" "+%s") # unix timestamp
-        local t=$(( $n - $d )) # idletime
+        local t=$(( $n - $d )) # userdletime
         #echo "$tty $d $t"
-        if [ $t -lt $idletime ]
+        if [ $t -lt $useridletime ]
         then
             echo -n "User active: $tty "
             printTime $t
@@ -138,7 +151,7 @@ function isNetworkUsed()
 
     if [ $total -gt $netthreshold ]
     then
-        echo "Network active: $total KiBps"
+        echo "Network active: $total KiBps (limit $netthreshold KiBps)"
         res=1
     fi
     return $res
@@ -150,7 +163,7 @@ function isLockFileTouched()
     if [ -f "$lockFile" ]
     then
         local t=$(( ($(date +%s) - $(stat -c %Y "$lockFile")) ))
-        if [ $t -lt $idletime ]
+        if [ $t -lt $useridletime ]
         then
             echo -n "Lock file touched: "
             printTime $t
@@ -189,12 +202,21 @@ function sendHibernate()
 
 function mainLoop()
 {
-    local mycountdown=$countdown
+    local idletime=0
     local stopLoop=0
     while [ $stopLoop -eq 0 ]
     do
         date +"%F %T"
-        local n=$(date "+%s")
+
+        # check day or night mode
+        local hour=$(date +%H)
+        countdown=$countdownNight
+        netthreshold=$netthresholdNight
+        if [ $hour -ge $dayTime -a $hour -lt $nightTime ]
+        then
+            countdown=$countdownDay
+            netthreshold=$netthresholdDay
+        fi
 
         local finalres=0
         local res=0
@@ -214,25 +236,25 @@ function mainLoop()
         # if finalres is 1 then we have at least one condition which prevents going to suspend
         if [ $finalres -eq 1 ]
         then
-            mycountdown=$countdown
+            idletime=0
             echo -n "Reset countdown: "
-            printTime $mycountdown
+            printTime $(( $countdown - $idletime ))
             echo ""
         else
-            mycountdown=$(( $mycountdown - $timestep ))
+            idletime=$(( $idletime + $timestep ))
             echo -n "Decrease countdown: "
-            printTime $mycountdown
+            printTime $(( $countdown - $idletime ))
             echo " before suspend"
         fi
 
-        if [ $mycountdown -le 0 ]
+        if [ $idletime -ge $countdown ]
         then
             echo "Go to suspend"
             # suspend command
             sendHibernate
 
             # reset countdown
-            mycountdown=$countdown
+            idletime=0
         fi
 
         echo -n "Sleep "
@@ -240,12 +262,12 @@ function mainLoop()
         echo ""
         sleep $timestep
 
-	if [ -f "$stopFile" ]
-	then
-		rm "$stopFile"
-		echo "Stop file touched, exiting..."
-		stopLoop=1
-	fi
+    if [ -f "$stopFile" ]
+    then
+        rm "$stopFile"
+        echo "Stop file touched, exiting..."
+        stopLoop=1
+    fi
     done
 }
 
