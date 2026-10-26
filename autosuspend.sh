@@ -1,275 +1,304 @@
 #!/bin/bash
-
-# autosuspend script:
-# After being launched, it will hibernate the machine (using pm-hibernate or
-# systemctl hibernate) after 1h if there is no user active on a console and
-# no network traffic (<100KiBps) and if the lock file has not been touched.
-# Author : Maxime Morel <maxime.morel69@gmail.com>
-
+#
+# autosuspend.sh
+#
+# Powers off (or suspends/hibernates) the machine when it has been idle for
+# a configurable time. The machine is considered busy if ANY of these is true:
+#   - a user is active on a console/tty (input within USER_IDLE_TIME seconds)
+#   - network traffic on the monitored interface is above the threshold
+#   - the lock file has been touched within USER_IDLE_TIME seconds
+#   - (optional) the 1-minute load average is above LOAD_THRESHOLD
+#
+# Usage:
+#   autosuspend.sh [countdown_seconds [timestep_seconds]]
+#
+#   countdown_seconds  overrides BOTH the day and night countdown
+#   timestep_seconds   polling interval (default 30)
+#
+# Everything can also be set through environment variables, e.g.:
+#   NETWORK_INTERFACE=enp3s0 ACTION=hibernate DRY_RUN=1 ./autosuspend.sh
+#
+# Control files (in STATE_DIR):
+#   autosuspend.lock  touch it to postpone shutdown
+#   autosuspend.stop  touch it to make the script exit
+#
+# Original author : Maxime Morel <maxime.morel69@gmail.com>
+#
 # Changelog
-# 2017/02/03:
-# Separate threshold for day and night.
-#
-# 2016/09/29:
-# Show remaining time in human format.
-# Countdown and time step can be set as a parameters.
-# Script can be stopped by touching a stop file.
-#
-# 2016/09/09:
-# Show date in log at each iteration.
-# Fix network traffic.
-#
-# 2016/09/07:
-# Fix indentation.
-# Detect at the beginning if systemd is present and store it in a flag.
-# Use bash function return values and local variables.
-# Allowing to delay hibernation by touching a lock file.
-# Use KiB unit.
-#
-# 2015/10/02:
-# Shutdown if kernel has been updated, to prevent any stall during wakeup.
-# Check for systemctl and use it if available instead of pm-hibernate.
-#
-# 2014/01/08:
-# No longer need dstat to compute netspeed, use /proc/net/dev.
-# Compute user idle time using stat on tty device, no more errors.
-# Fix getting stat info with ls -lu (atime field).
-#
-# 2014/01/06:
-# Currently quite ugly, but does what I need:
-# Allows me to wake my storage machine and let it autosuspend if unused.
+# 2026 revision:
+#   Action is now explicit and configurable (poweroff|hibernate|suspend).
+#   CLI arguments are honoured again.
+#   Network interface auto-detected, matched exactly, first sample primed.
+#   Fail safe: if the interface or a check cannot be read, assume "busy".
+#   Idle detection uses stat instead of parsing ls output.
+#   State files moved from /tmp to /run (or a per-user dir when not root).
+#   Single-instance protection with flock.
+#   Stop file checked at the top of the loop and during sleep.
+#   Optional load-average check and DRY_RUN mode.
+# 2017/02/03: Separate threshold for day and night.
+# 2016/09/29: Human readable remaining time, parameters, stop file.
+# 2016/09/09: Date in log, network traffic fix.
+# 2016/09/07: Systemd detection, lock file, KiB unit.
+# 2015/10/02: Poweroff if kernel updated; prefer systemctl.
+# 2014/01/08: Use /proc/net/dev instead of dstat; tty idle via stat.
+# 2014/01/06: Initial version.
 
-# day time starts at 7:00
-dayTime=7
+set -u
 
-# night time starts at 23:00
-nightTime=23
+# ---------------------------------------------------------------- settings --
 
-# countdown in seconds
-countdown=14400
-countdownDay=14400
-countdownNight=7200
-if [ $# -ge 1 ]
-then
-    countdown=$1
+# What to do when idle: poweroff | hibernate | suspend
+ACTION=${ACTION:-poweroff}
+
+# Day time window [DAY_START, NIGHT_START) in hours (0-23)
+DAY_START=${DAY_START:-7}
+NIGHT_START=${NIGHT_START:-23}
+
+# Idle countdown in seconds
+COUNTDOWN_DAY=${COUNTDOWN_DAY:-14400}
+COUNTDOWN_NIGHT=${COUNTDOWN_NIGHT:-7200}
+
+# Network threshold (KiB/s, rx+tx) above which the machine is "busy"
+NET_THRESHOLD_DAY=${NET_THRESHOLD_DAY:-100}
+NET_THRESHOLD_NIGHT=${NET_THRESHOLD_NIGHT:-2000}
+
+# Network interface to monitor (auto-detected from default route if empty)
+NETWORK_INTERFACE=${NETWORK_INTERFACE:-}
+
+# Seconds of tty/lock-file inactivity before they stop counting as "active"
+USER_IDLE_TIME=${USER_IDLE_TIME:-60}
+
+# Optional: 1-minute load average above which the machine is busy
+# (e.g. LOAD_THRESHOLD=0.5). Empty = disabled.
+LOAD_THRESHOLD=${LOAD_THRESHOLD:-}
+
+# Polling interval in seconds
+TIMESTEP=${TIMESTEP:-30}
+
+# 1 = only log what would happen, never shut down
+DRY_RUN=${DRY_RUN:-0}
+
+# Where the lock/stop/pid files live
+if [[ $EUID -eq 0 ]]; then
+    STATE_DIR=${STATE_DIR:-/run/autosuspend}
+else
+    STATE_DIR=${STATE_DIR:-/tmp/autosuspend-$EUID}
 fi
 
-# timestep in seconds
-timestep=30
-if [ $# -ge 2 ]
-then
-    timestep=$2
+# ---------------------------------------------------------- CLI arguments --
+
+is_uint() { [[ $1 =~ ^[0-9]+$ ]]; }
+
+if [[ $# -ge 1 ]]; then
+    is_uint "$1" || { echo "countdown must be a positive integer" >&2; exit 2; }
+    COUNTDOWN_DAY=$1
+    COUNTDOWN_NIGHT=$1
+fi
+if [[ $# -ge 2 ]]; then
+    is_uint "$2" || { echo "timestep must be a positive integer" >&2; exit 2; }
+    TIMESTEP=$2
+fi
+(( TIMESTEP > 0 )) || { echo "timestep must be > 0" >&2; exit 2; }
+
+# ------------------------------------------------------------------ setup --
+
+# Sticky, world-writable dir: any user may touch the lock/stop files, but
+# cannot tamper with files owned by others (no /tmp symlink games).
+mkdir -p "$STATE_DIR" || { echo "cannot create $STATE_DIR" >&2; exit 1; }
+chmod 1777 "$STATE_DIR" 2>/dev/null
+
+LOCK_FILE="$STATE_DIR/autosuspend.lock"
+STOP_FILE="$STATE_DIR/autosuspend.stop"
+PID_FILE="$STATE_DIR/autosuspend.pid"
+
+touch "$LOCK_FILE" && chmod 666 "$LOCK_FILE" 2>/dev/null
+
+# Single instance
+exec 9>"$PID_FILE"
+if ! flock -n 9; then
+    echo "autosuspend is already running" >&2
+    exit 1
+fi
+echo $$ >&9
+
+HAS_SYSTEMD=0
+command -v systemctl >/dev/null 2>&1 && HAS_SYSTEMD=1
+
+if [[ -z $NETWORK_INTERFACE ]]; then
+    NETWORK_INTERFACE=$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
+    NETWORK_INTERFACE=${NETWORK_INTERFACE:-eth0}
 fi
 
-# user idle time before sleep
-useridletime=60
+# ---------------------------------------------------------------- helpers --
 
-# network threshold to go below before sleep in KiBps
-netthreshold=100
-netthresholdDay=100
-netthresholdNight=2000
+log() { echo "$(date '+%F %T') $*"; }
 
-# network interface to monitor
-network_interface=eth0
-
-# lock file to force hibernation delay
-lockFile=/tmp/autosuspend.lock
-touch "$lockFile"
-chmod 666 "$lockFile"
-
-# do we have systemd?
-hasSystemd=0
-which systemctl > /dev/null
-if [ $? -eq 0 ]
-then
-    hasSystemd=1
-fi
-
-# nb iterations (test purpose)
-nbiter=10
-
-# stop file, touch it to exit the script
-stopFile=/tmp/autosuspend.stop
-
-function printTime()
-{
+format_time() {
     local t=$1
-    local hours=$(( $t / 3600 ))
-    local minutes=$(( $t % 3600 ))
-    local seconds=$(( $minutes % 60 ))
-    minutes=$(( $minutes / 60 ))
-    if [ $hours -gt 0 ]
-    then
-        echo -n "${hours}h "
-    fi
-    if [ $minutes -gt 0 -o $hours -gt 0 ]
-    then
-        echo -n "${minutes}m "
-    fi
-    echo -n "${seconds}s"
+    local h=$(( t / 3600 ))
+    local m=$(( (t % 3600) / 60 ))
+    local s=$(( t % 60 ))
+    local out=""
+    (( h > 0 )) && out+="${h}h "
+    (( h > 0 || m > 0 )) && out+="${m}m "
+    out+="${s}s"
+    echo "$out"
 }
 
-function isUserActive()
-{
-    local res=0
-    local n=$(date "+%s")
-    local tty
-    for tty in $(w -h | tr -s ' ' | cut -d' ' -f2)
-    do
-        # stat the tty device to have last modif time
-        local lastmodif=$(ls -lu --time-style=full-iso /dev/$tty | tr -s ' ' | cut -d' ' -f 7,8,9)
-        local d=$(date -d "$lastmodif" "+%s") # unix timestamp
-        local t=$(( $n - $d )) # userdletime
-        #echo "$tty $d $t"
-        if [ $t -lt $useridletime ]
-        then
-            echo -n "User active: $tty "
-            printTime $t
-            echo ""
-            res=1
+# Total rx+tx bytes of the monitored interface (exact match). Fails if absent.
+read_net_bytes() {
+    awk -v i="$NETWORK_INTERFACE" '
+        { sub(/:/, " ") }
+        $1 == i { print $2 + $10; found = 1 }
+        END { exit !found }
+    ' /proc/net/dev
+}
+
+# ----------------------------------------------------------------- checks --
+# Each check returns 0 when it considers the machine BUSY, 1 when idle.
+
+OLD_NET_TOTAL=""
+
+check_user_active() {
+    local busy=1 now tty last idle
+    now=$(date +%s)
+    while read -r tty; do
+        [[ -n $tty && -e /dev/$tty ]] || continue
+        last=$(stat -c %X "/dev/$tty" 2>/dev/null) || continue
+        idle=$(( now - last ))
+        if (( idle < USER_IDLE_TIME )); then
+            log "User active on $tty (last input $(format_time "$idle") ago)"
+            busy=0
         fi
-    done
-    return $res
+    done < <(who | awk '{print $2}')
+    return $busy
 }
 
-old_total=0
-function isNetworkUsed()
-{
-    local res=0
-    local val=$(cat /proc/net/dev | grep $network_interface | tr -s ' ' | cut -f3,11 -d ' ')
-    local down=$(echo $val | cut -f1 -d' ')
-    local up=$(echo $val | cut -f2 -d' ')
-    local fulltotal=$(( $down + $up ))
-    local total=$(( $fulltotal - $old_total ))
-    old_total=$fulltotal
-
-    # per sec value
-    total=$(( $total / $timestep ))
-
-    # put in KiBps
-    total=$(( $total / 1024 ))
-
-    if [ $total -gt $netthreshold ]
-    then
-        echo "Network active: $total KiBps (limit $netthreshold KiBps)"
-        res=1
-    fi
-    return $res
-}
-
-function isLockFileTouched()
-{
-    local res=0
-    if [ -f "$lockFile" ]
-    then
-        local t=$(( ($(date +%s) - $(stat -c %Y "$lockFile")) ))
-        if [ $t -lt $useridletime ]
-        then
-            echo -n "Lock file touched: "
-            printTime $t
-            echo ""
-            res=1
-        fi
+check_network_used() {
+    local total rate
+    if ! total=$(read_net_bytes); then
+        log "Cannot read interface '$NETWORK_INTERFACE', assuming network busy"
+        return 0
     fi
 
-    return $res
+    # First sample only primes the counter
+    if [[ -z $OLD_NET_TOTAL ]]; then
+        OLD_NET_TOTAL=$total
+        return 1
+    fi
+
+    local diff=$(( total - OLD_NET_TOTAL ))
+    OLD_NET_TOTAL=$total
+    (( diff < 0 )) && diff=0            # counter reset or wrap
+
+    rate=$(( diff / TIMESTEP / 1024 ))  # KiB/s
+    if (( rate > NET_THRESHOLD )); then
+        log "Network active: ${rate} KiB/s (limit ${NET_THRESHOLD} KiB/s)"
+        return 0
+    fi
+    return 1
 }
 
-function sendHibernate()
-{
+check_lock_file() {
+    [[ -f $LOCK_FILE ]] || return 1
+    local age=$(( $(date +%s) - $(stat -c %Y "$LOCK_FILE") ))
+    if (( age < USER_IDLE_TIME )); then
+        log "Lock file touched $(format_time "$age") ago"
+        return 0
+    fi
+    return 1
+}
+
+check_load() {
+    [[ -n $LOAD_THRESHOLD ]] || return 1
+    local load
+    read -r load _ < /proc/loadavg || return 1
+    if awk -v l="$load" -v t="$LOAD_THRESHOLD" 'BEGIN { exit !(l > t) }'; then
+        log "Load average high: $load (limit $LOAD_THRESHOLD)"
+        return 0
+    fi
+    return 1
+}
+
+# ----------------------------------------------------------------- action --
+
+do_action() {
+    local action=$ACTION
+
+    # A new kernel without matching modules may not resume properly
+    if [[ ! -d /lib/modules/$(uname -r) && $action != poweroff ]]; then
+        log "Kernel has been updated, powering off instead of $action"
+        action=poweroff
+    fi
+
+    log "Going to $action"
+    if (( DRY_RUN )); then
+        log "DRY_RUN set, doing nothing"
+        return
+    fi
+
     sync
-    if [ -d /lib/modules/$(uname -r) ]
-    then
-        if [ $hasSystemd == 1 ]
-        then
-            #systemctl hibernate
-            systemctl poweroff
-        else
-            #pm-suspend
-            #pm-hibernate
-            shutdown -h now
-        fi
+    if (( HAS_SYSTEMD )); then
+        systemctl "$action"
     else
-        echo "The kernel has been updated, better to shutdown"
-        if [ $hasSystemd == 1 ]
-        then
-            systemctl poweroff
-        else
-            shutdown -h now
-        fi
+        case $action in
+            poweroff)  shutdown -h now ;;
+            hibernate) pm-hibernate ;;
+            suspend)   pm-suspend ;;
+        esac
     fi
 }
 
-function mainLoop()
-{
-    local idletime=0
-    local stopLoop=0
-    while [ $stopLoop -eq 0 ]
-    do
-        date +"%F %T"
+# ------------------------------------------------------------- main loop --
 
-        # check day or night mode
-        local hour=$(date +%H)
-        countdown=$countdownNight
-        netthreshold=$netthresholdNight
-        if [ $hour -ge $dayTime -a $hour -lt $nightTime ]
-        then
-            countdown=$countdownDay
-            netthreshold=$netthresholdDay
+main_loop() {
+    local idle=0 hour countdown busy
+
+    log "Started: interface=$NETWORK_INTERFACE action=$ACTION timestep=${TIMESTEP}s dry_run=$DRY_RUN"
+
+    while :; do
+        if [[ -f $STOP_FILE ]]; then
+            rm -f "$STOP_FILE"
+            log "Stop file found, exiting"
+            return
         fi
 
-        local finalres=0
-        local res=0
-
-        isUserActive
-        res=$?
-        finalres=$(( $finalres | $res ))
-
-        isNetworkUsed
-        res=$?
-        finalres=$(( $finalres | $res ))
-
-        isLockFileTouched
-        res=$?
-        finalres=$(( $finalres | $res ))
-
-        # if finalres is 1 then we have at least one condition which prevents going to suspend
-        if [ $finalres -eq 1 ]
-        then
-            idletime=0
-            echo -n "Reset countdown: "
-            printTime $(( $countdown - $idletime ))
-            echo ""
+        hour=$(date +%-H)
+        if (( hour >= DAY_START && hour < NIGHT_START )); then
+            countdown=$COUNTDOWN_DAY
+            NET_THRESHOLD=$NET_THRESHOLD_DAY
         else
-            idletime=$(( $idletime + $timestep ))
-            echo -n "Decrease countdown: "
-            printTime $(( $countdown - $idletime ))
-            echo " before suspend"
+            countdown=$COUNTDOWN_NIGHT
+            NET_THRESHOLD=$NET_THRESHOLD_NIGHT
         fi
 
-        if [ $idletime -ge $countdown ]
-        then
-            echo "Go to suspend"
-            # suspend command
-            sendHibernate
+        # Run every check (no short-circuit) so each one logs and updates state
+        busy=0
+        check_user_active  && busy=1
+        check_network_used && busy=1
+        check_lock_file    && busy=1
+        check_load         && busy=1
 
-            # reset countdown
-            idletime=0
+        if (( busy )); then
+            idle=0
+            log "Busy, countdown reset to $(format_time "$countdown")"
+        else
+            idle=$(( idle + TIMESTEP ))
+            log "Idle, $(format_time $(( countdown > idle ? countdown - idle : 0 ))) before $ACTION"
         fi
 
-        echo -n "Sleep "
-        printTime $timestep
-        echo ""
-        sleep $timestep
+        if (( idle >= countdown )); then
+            do_action
+            idle=0
+        fi
 
-    if [ -f "$stopFile" ]
-    then
-        rm "$stopFile"
-        echo "Stop file touched, exiting..."
-        stopLoop=1
-    fi
+        # Sleep in 1s slices so the stop file is honoured quickly
+        local i
+        for (( i = 0; i < TIMESTEP; i++ )); do
+            [[ -f $STOP_FILE ]] && break
+            sleep 1
+        done
     done
 }
 
-mainLoop
-
+main_loop
